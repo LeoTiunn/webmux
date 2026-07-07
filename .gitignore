@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+.eggs/
+*.whl
+uv.lock
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tool artifacts
+.disney_dev_mcp/
+.chroma/
+
+# Build artifacts
+dist/
+
+# Secrets & credentials — never commit these
+*.pem
+*.key
+*.crt
+.env
+.env.*
+*.local
+webmux-env
+config/env
+*-restore-*.json
+
+# Internal notes / handovers — not for public repo
+HANDOVER-*.md
+docs/journal.md
