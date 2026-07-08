@@ -2,13 +2,14 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.17.0"
+__version__ = "1.18.0"
 
 import asyncio
 import fcntl
 import json
 import os
 import pty
+import re
 import secrets
 import signal
 import ssl
@@ -98,29 +99,143 @@ def git_branch_for(cwd, now):
     return branch
 
 
+# Cache: claude pid -> conversation id. A claude process holds the same
+# transcript for its whole life, so this only needs resolving once per pid.
+# Pruned each sweep to the set of still-living pids.
+_CONV_ID_CACHE = {}  # type: Dict[int, Optional[str]]
+_UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+
+
+def _snapshot_processes():
+    # type: () -> Dict[int, tuple]
+    """One `ps` call → {pid: (ppid, command)} for the whole process table.
+
+    Doing this once per sweep (instead of pgrep+ps per pane) is the difference
+    between a ~20s sweep and a sub-second one on a machine with dozens of panes.
+    """
+    procs = {}
+    try:
+        out = subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="],
+                                      text=True, stderr=subprocess.DEVNULL, timeout=5)
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return procs
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, parts[2] if len(parts) > 2 else "")
+    return procs
+
+
+def _looks_like_claude(cmd):
+    # type: (str) -> bool
+    """Heuristic to decide if a pane child is a claude process worth probing.
+    Claude renames itself to a bare version string like "2.1.204", runs via
+    node, or still shows "claude"/--resume/--continue on the cmdline. A plain
+    login shell (zsh/bash/-zsh) is NOT — skip it so we never lsof shells."""
+    c = cmd.strip()
+    if not c:
+        return False
+    if "claude" in c or "--resume" in c or "--continue" in c or "node" in c:
+        return True
+    # bare version string (e.g. "2.1.204") — Claude's renamed process
+    if re.match(r"^\d+\.\d+", c):
+        return True
+    return False
+
+
+def _resolve_conv_id(cpid, cmd):
+    # type: (int, str) -> Optional[str]
+    """Conversation id for a claude pid from its command line (`--resume <id>`).
+
+    This is cheap (no extra syscalls — cmd is already in the ps snapshot) and
+    exact. webmux always starts sessions with `--resume <id>`, so this covers
+    every webmux-created session. Sessions started with `--continue` (or by
+    hand) have no id on the cmdline → return None and let the caller fall back
+    to the name/mtime heuristic. We deliberately do NOT lsof: it was ~0.5s per
+    pane and unreliable for finding the transcript."""
+    if cpid in _CONV_ID_CACHE:
+        return _CONV_ID_CACHE[cpid]
+    conv = None
+    m = re.search(r"--resume\s+(" + _UUID_RE.pattern + r")", cmd)
+    if m:
+        conv = m.group(1)
+    _CONV_ID_CACHE[cpid] = conv
+    return conv
+
+
+def _claude_descendant(pane_pid, procs):
+    # type: (Optional[int], Dict[int, tuple]) -> Optional[tuple]
+    """Find the claude (pid, cmd) under a pane, walking the process tree — the
+    claude process is often a GRANDCHILD (pane shell → login shell → claude),
+    not a direct child. Returns (pid, cmd) or None."""
+    if not pane_pid or not procs:
+        return None
+    # children index
+    kids = {}  # type: Dict[int, list]
+    for pid, (ppid, cmd) in procs.items():
+        kids.setdefault(ppid, []).append((pid, cmd))
+    stack = list(kids.get(pane_pid, []))
+    seen = set()
+    while stack:
+        pid, cmd = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if _looks_like_claude(cmd):
+            return (pid, cmd)
+        stack.extend(kids.get(pid, []))
+    return None
+
+
+def _conv_id_for_pane(pane_pid, procs):
+    # type: (Optional[int], Dict[int, tuple]) -> Optional[str]
+    """Ground-truth conversation id for a pane, using a pre-built process map."""
+    hit = _claude_descendant(pane_pid, procs)
+    if not hit:
+        return None
+    return _resolve_conv_id(hit[0], hit[1])
+
+
 def get_tmux_sessions():
     # type: () -> List[Dict]
-    sessions = []
     import time as _time
     now = _time.monotonic()
+    procs = _snapshot_processes()  # one ps call for the whole sweep
+    rows = []
     try:
         out = subprocess.check_output(
             ["tmux", "list-sessions", "-F",
-             "#{session_name}:#{pane_current_path}:#{pane_current_command}:#{session_activity}"],
+             "#{session_name}:#{pane_current_path}:#{pane_current_command}:#{session_activity}:#{pane_pid}"],
             text=True, stderr=subprocess.DEVNULL, timeout=5
         )
         for line in out.strip().splitlines():
-            parts = line.split(":", 3)
+            parts = line.split(":", 4)
             if len(parts) < 2:
                 continue
-            name, cwd = parts[0], parts[1]
-            cmd = parts[2] if len(parts) > 2 else ""
-            activity = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
-            status = "active" if "claude" in cmd.lower() or "node" in cmd.lower() else "idle"
-            sessions.append({"name": name, "cwd": cwd, "status": status, "command": cmd,
-                             "activity": activity, "branch": git_branch_for(cwd, now)})
+            rows.append((parts[0], parts[1],
+                         parts[2] if len(parts) > 2 else "",
+                         int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0,
+                         int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None))
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    # Resolve each pane's claude descendant + its conversation id. conv id comes
+    # straight from the process command line now (no lsof), so this is cheap.
+    sessions = []
+    for (name, cwd, cmd, activity, pane_pid) in rows:
+        hit = _claude_descendant(pane_pid, procs)
+        conv_id = _resolve_conv_id(hit[0], hit[1]) if hit else None
+        status = "active" if (hit or "claude" in cmd.lower() or "node" in cmd.lower()) else "idle"
+        sessions.append({"name": name, "cwd": cwd, "status": status, "command": cmd,
+                         "activity": activity, "branch": git_branch_for(cwd, now),
+                         "conv_id": conv_id})
+    # Prune conv-id cache entries whose pid is gone (using the same snapshot).
+    for dead in [p for p in _CONV_ID_CACHE if p not in procs]:
+        del _CONV_ID_CACHE[dead]
     return sessions
 
 
@@ -139,8 +254,31 @@ def list_projects():
     return projects
 
 
+def clean_name(raw, fallback="session"):
+    # type: (str, str) -> str
+    """Sanitize a user/derived name into a safe tmux session name.
+
+    tmux treats '.' as a target separator (session.window.pane), so a name with
+    a dot makes send-keys / kill / rename fail — the session becomes an unusable
+    ghost. Also collapse whitespace and any other unsafe char to '-'. Result
+    contains only [A-Za-z0-9_-]. Used for BOTH the tmux name and the `claude -n`
+    name so the two stay consistent.
+    """
+    s = re.sub(r"[^A-Za-z0-9_-]+", "-", (raw or "").strip())
+    s = re.sub(r"-+", "-", s).strip("-_")
+    return s or fallback
+
+
+def _valid_conv_id(cid):
+    # type: (Optional[str]) -> bool
+    return bool(cid) and bool(_UUID_RE.fullmatch(cid or ""))
+
+
 def create_session(name, directory, resume_id=None, fresh=False, claude_name=None, branch=None):
     # type: (str, str, Optional[str], bool, Optional[str], Optional[str]) -> Dict
+    # Harden the tmux session name: a stray '.' (e.g. "v1.2" or a "next.js" dir)
+    # would make every later `tmux -t <name>` command fail. Never trust the caller.
+    name = clean_name(name)
     try:
         # Optional: switch to (or create) a git branch in the directory BEFORE
         # launching claude. NOTE: this directory is shared by all sessions of the
@@ -157,6 +295,10 @@ def create_session(name, directory, resume_id=None, fresh=False, claude_name=Non
                     if cr.returncode != 0:
                         return {"ok": False,
                                 "error": "git checkout failed: " + (cr.stderr or co.stderr or "unknown").strip()[:200]}
+        # resume_id is interpolated into a shell command sent via send-keys, so
+        # it MUST be a real conversation UUID — never trust arbitrary input.
+        if resume_id and not _valid_conv_id(resume_id):
+            return {"ok": False, "error": "invalid resume_id"}
         subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", directory],
                        check=True, capture_output=True, text=True, timeout=5)
         if resume_id:
@@ -164,9 +306,11 @@ def create_session(name, directory, resume_id=None, fresh=False, claude_name=Non
         elif fresh:
             # A genuinely NEW session — never --continue. Optionally name it via
             # `claude -n <name>` so the name shows in Claude's own /resume picker.
+            # Use the same sanitizer as the tmux name so the two stay consistent
+            # (spaces → '-', not silently deleted).
             cmd = "claude --dangerously-skip-permissions"
             if claude_name:
-                safe = "".join(ch for ch in claude_name if ch.isalnum() or ch in "-_")
+                safe = clean_name(claude_name, fallback="")
                 if safe:
                     cmd = "claude -n " + safe + " --dangerously-skip-permissions"
         else:
@@ -470,7 +614,7 @@ def session_meta():
     return meta
 
 
-def list_conversations(cwd, limit=15):
+def list_conversations(cwd, limit=50):
     # type: (str, int) -> List[Dict]
     proj = find_project_dir(cwd)
     if not proj:
@@ -614,6 +758,13 @@ async def api_create_session(request):
     branch = body.get("branch") or None
     if not name or not directory:
         return web.json_response({"ok": False, "error": "name and directory required"}, status=400)
+    # Guard against resuming a conversation that ALREADY has a live session:
+    # two `claude --resume <same id>` processes would append the same transcript
+    # and corrupt it. If one exists, return its name so the client just attaches.
+    if resume_id:
+        for s in get_tmux_sessions():
+            if s.get("conv_id") == resume_id:
+                return web.json_response({"ok": True, "name": s["name"], "existing": True})
     result = create_session(name, directory, resume_id=resume_id, fresh=fresh,
                             claude_name=claude_name, branch=branch)
     return web.json_response(result, status=200 if result.get("ok") else 500)
@@ -1929,7 +2080,9 @@ function loadConversations(cwd) {
 // then attach. It then becomes a running session within that project.
 function resumeConversation(cwd, convId) {
   var base = cwd.replace(/\/+$/, '').split('/').pop() || 'session';
-  var name = (base + '-' + convId.slice(0, 6)).replace(/[^A-Za-z0-9_.-]/g, '-');
+  // Strip '.' too — a dotted tmux name (e.g. dir "next.js") breaks every later
+  // `tmux -t <name>` command. Backend re-sanitizes, but keep the client honest.
+  var name = (base + '-' + convId.slice(0, 6)).replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-');
   fetch('/api/sessions/create', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -2196,17 +2349,30 @@ function attachTip(el, nameHtml, metaHtml) {
 }
 
 // Map live tmux sessions in a project to conversation ids.
-// Pass 1: session named "<name>-<6hex>" → conversation whose id starts with that hex.
-// Pass 2: any remaining live session → newest unclaimed conversation (claude --continue
-// resumes the most recent). Leftover live sessions (no conv to claim) returned separately.
+// Pass 0: session.conv_id — the REAL conversation the pane's claude process is
+//   on, resolved server-side from the process (ps --resume id / lsof open jsonl).
+//   This is ground truth; when present it always wins, immune to renames and
+//   mtime churn (the cause of sessions showing the wrong conversation).
+// Pass 1 (fallback): session named "<name>-<6hex>" → conversation id prefix.
+// Pass 2 (fallback): remaining live session → newest unclaimed conversation.
+// Leftover live sessions (no conv to claim) returned separately.
 function mapLiveToConv(live, convs) {
   var map = {}, claimed = {}, leftover = [], mapped = {};
+  // Pass 0 — authoritative conv_id from the backend.
   live.forEach(function(s) {
+    if (!s.conv_id) return;
+    var hit = convs.find(function(c) { return c.id === s.conv_id && !claimed[c.id]; });
+    if (hit) { map[hit.id] = s.name; claimed[hit.id] = true; mapped[s.name] = true; }
+  });
+  // Pass 1 — legacy "-<6hex>" suffix heuristic (only for sessions still unmapped).
+  live.forEach(function(s) {
+    if (mapped[s.name]) return;
     var m = s.name.match(/-([0-9a-f]{6})$/i);
     if (!m) return;
     var hit = convs.find(function(c) { return c.id.slice(0, 6) === m[1].toLowerCase() && !claimed[c.id]; });
     if (hit) { map[hit.id] = s.name; claimed[hit.id] = true; mapped[s.name] = true; }
   });
+  // Pass 2 — last-resort newest-unclaimed guess.
   live.forEach(function(s) {
     if (mapped[s.name]) return;
     var hit = convs.find(function(c) { return !claimed[c.id]; });
@@ -2230,9 +2396,12 @@ function makeHistoryRow(cwd, c, liveName) {
   })();
   el.className = 'session-item nested hist' + (isAttached ? ' active' : '') + (isLive ? ' live' : '');
   // Title priority: Claude Code's own session name (set via /rename) → webmux
-  // display name (for ended sessions Claude can't rename) → summary → hashcode.
+  // display name (for ended sessions Claude can't rename) → summary → the live
+  // tmux session name (the name the user typed when creating it, before Claude
+  // has a summary/rename) → hashcode. The tmux-name fallback is why a freshly
+  // created session shows the name you typed instead of a random id.
   var customName = groupCfg.names && groupCfg.names[c.id];
-  var title = c.claude_name || customName || c.summary || c.id.slice(0, 8);
+  var title = c.claude_name || customName || c.summary || (isLive ? liveName : '') || c.id.slice(0, 8);
   // For a live session, the tmux pane's CURRENT branch beats the conversation's
   // historical branch (you may have checked out a different branch since).
   var branch = c.branch;
