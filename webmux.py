@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.19.2"
+__version__ = "1.19.3"
 
 import asyncio
 import fcntl
@@ -2383,6 +2383,13 @@ function loadSessions() {
     });
 }
 
+// Sanitize a name the same way the backend clean_name() does (spaces + unsafe
+// chars → '-', collapse, trim) so a conversation name and its tmux session name
+// compare equal even though one may keep spaces.
+function treeCleanName(s) {
+  return String(s || '').trim().replace(/[^A-Za-z0-9_-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').toLowerCase();
+}
+
 // --- Project order (by cwd) persistence ---
 function getProjectOrder() {
   try { return JSON.parse(localStorage.getItem('webmux-project-order') || '[]'); }
@@ -2589,8 +2596,12 @@ function renameSessionRow(cwd, c, liveName) {
         localStorage.setItem('webmux-last-session', d.tmux);
         location.hash = encodeURIComponent(d.tmux);
       }
-      // Claude writes the name async; refresh shortly to pick it up.
-      setTimeout(function() { delete convCache[cwd]; loadSessions(); }, 800);
+      // Refresh immediately so the row reflects the new name right away, then
+      // again after Claude finishes its async write (so the conversation's
+      // claude_name catches up). The name-based PAST-row suppression prevents a
+      // duplicate row in the gap between the two.
+      delete convCache[cwd]; loadSessions();
+      setTimeout(function() { delete convCache[cwd]; loadSessions(); }, 900);
     });
   } else {
     if (!groupCfg.names) groupCfg.names = {};
@@ -2740,8 +2751,16 @@ function renderProjectList(projects, container, category) {
     // size/branch when available.
     var convById = {};
     convs.forEach(function(c) { convById[c.id] = c; });
-    var liveConvIds = {}, seenConv = {};
+    // Sanitized names of live sessions — used to suppress a duplicate PAST row
+    // during the brief window after a rename where conv_id hasn't re-resolved
+    // yet (tmux name and conversation name are kept in sync, so the sanitized
+    // forms match even before conv_id catches up).
+    var liveNameKeys = {};
+    p.live.forEach(function(s) { liveNameKeys[treeCleanName(s.name)] = true; });
+    var liveConvIds = {}, seenConv = {}, seenSess = {};
     p.live.forEach(function(s) {
+      if (seenSess[s.name]) return;          // one row per tmux session, always
+      seenSess[s.name] = true;
       var c = s.conv_id && convById[s.conv_id];
       // Enforce 1:1 — a conversation shows ONE row even if two tmux sessions
       // happen to be on it (attach the first/most-relevant; the dup is hidden).
@@ -2758,9 +2777,14 @@ function renderProjectList(projects, container, category) {
                      branch: s.branch || '', size: 0};
       container.appendChild(makeHistoryRow(p.cwd, row, s.name));
     });
-    // PAST rows = conversations with no live session on them → click to resume.
+    // PAST rows = conversations with NO live session on them → click to resume.
+    // Exclude by conv_id AND by sanitized-name (covers the post-rename window
+    // before conv_id re-resolves, so the just-renamed session never doubles).
     convs.forEach(function(c) {
-      if (!liveConvIds[c.id]) container.appendChild(makeHistoryRow(p.cwd, c, null));
+      if (liveConvIds[c.id]) return;
+      var nm = c.claude_name || (groupCfg.names && groupCfg.names[c.id]) || c.summary || '';
+      if (nm && liveNameKeys[treeCleanName(nm)]) return;
+      container.appendChild(makeHistoryRow(p.cwd, c, null));
     });
   });
 }
