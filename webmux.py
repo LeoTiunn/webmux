@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.18.1"
+__version__ = "1.19.0"
 
 import asyncio
 import fcntl
@@ -1240,6 +1240,17 @@ HTML = r"""<!DOCTYPE html>
     --mono: 'JetBrains Mono', monospace;
     --sidebar-w: 260px;
     --radius: 10px;
+    /* Sidebar tree — VS Code-style even indent staircase. Row left edge is
+       fixed; each level's TEXT is pushed one --tree-step deeper via padding.
+       Carets are absolutely positioned in the 16px slot just left of the text,
+       so caret width never shifts text alignment. One vertical guide line runs
+       down each expanded category, aligned to the project caret column. */
+    --tree-step: 16px;
+    --tree-cat: 14px;    /* category label text x */
+    --tree-proj: 30px;   /* project name text x   (cat + step) */
+    --tree-sess: 46px;   /* session name text x   (proj + step) */
+    --tree-caret: 16px;  /* caret slot width */
+    --tree-font: 14px;   /* one font size for the whole tree */
   }
 
   body.light, html.light {
@@ -1335,44 +1346,49 @@ HTML = r"""<!DOCTYPE html>
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 12px 14px;
+    padding: 6px 14px;
     border-radius: var(--radius);
     cursor: pointer;
-    transition: all 0.15s ease;
-    margin-bottom: 2px;
+    transition: background 0.12s ease;
+    margin-bottom: 1px;
     position: relative;
   }
   .session-item.dragging { opacity: 0.4; }
   .session-item.drag-over { border-top: 2px solid var(--accent); margin-top: -2px; }
   .session-item:hover { background: var(--bg-sidebar-hover); }
   .session-item.active { background: rgba(232,168,73,0.06); }
-  .session-item.active::before {
+  .session-item.active::after {
     content: '';
     position: absolute;
     left: 0; top: 50%;
     transform: translateY(-50%);
-    width: 3px; height: 20px;
+    width: 3px; height: 18px;
     background: var(--accent);
     border-radius: 0 3px 3px 0;
   }
 
-  .session-dot {
-    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-  }
+  /* Status dot — retired from the sidebar (a wall of identical green dots
+     carried no signal). Kept for the Cmd+K palette + history list only. */
+  .session-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
   .session-dot.active { background: var(--green); box-shadow: 0 0 6px var(--green-dim); }
-  .session-dot.idle { background: var(--text-muted); opacity: 0.4; }
-  .session-dot.unread { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
+  .session-dot.hist-dot {
+    width: 6px; height: 6px;
+    border: 1px solid var(--text-muted); background: transparent; opacity: 0.6;
+  }
 
   .session-info { flex: 1; overflow: hidden; }
   .session-name {
-    font-size: 16px; font-weight: 500; white-space: nowrap;
+    font-size: var(--tree-font); font-weight: 400; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; color: var(--text-dim);
   }
   .session-item.active .session-name { color: var(--text); }
   .session-item:hover .session-name { color: var(--text); }
+  /* Ended (not-live) sessions read dimmed; unread lights the name + pip. */
+  .session-item.dead .session-name { color: var(--text-muted); }
+  .session-item.unread .session-name { color: var(--accent); }
   .session-path {
-    font-size: 12px; color: var(--text-muted); white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis; margin-top: 2px;
+    font-size: 11px; color: var(--text-muted); white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
     font-family: var(--mono);
   }
 
@@ -1404,84 +1420,88 @@ HTML = r"""<!DOCTYPE html>
   }
   .session-rename:hover { background: var(--accent-dim); color: var(--accent); }
 
+  /* ===== Sidebar tree (VS Code-style): CATEGORY > PROJECT > SESSION =====
+     Even indent staircase, carets absolutely positioned, one font size, one
+     guide line per expanded category. Level = indentation + colour, not size. */
+
+  /* PROJECT (level 2) */
   .repo-group {
-    display: flex; align-items: center; gap: 7px; position: relative;
-    padding: 9px 12px; cursor: pointer; user-select: none;
-    color: var(--text-dim); font-size: 16px; font-weight: 500;
+    display: flex; align-items: center; position: relative;
+    padding: 6px 12px 6px var(--tree-proj); cursor: pointer; user-select: none;
+    color: var(--text); font-size: var(--tree-font); font-weight: 500;
     border-radius: var(--radius); margin-bottom: 1px;
-    transition: all 0.15s;
+    transition: background 0.12s, color 0.12s;
   }
-  .repo-group:hover { background: var(--bg-sidebar-hover); color: var(--text); }
+  .repo-group:hover { background: var(--bg-sidebar-hover); }
   .repo-group.has-active { color: var(--text); }
   .repo-caret {
-    font-size: 11px; width: 20px; height: 20px; flex-shrink: 0;
+    position: absolute; left: calc(var(--tree-proj) - var(--tree-caret));
+    top: 50%; transform: translateY(-50%);
+    font-size: 10px; width: var(--tree-caret); height: 18px;
     display: flex; align-items: center; justify-content: center;
-    margin: -2px 0 -2px -4px; border-radius: 4px;
-    color: var(--text-muted); transition: all 0.15s;
+    color: var(--text-muted); transition: color 0.12s;
   }
-  .repo-caret:hover { background: var(--bg-sidebar); color: var(--accent); }
+  .repo-caret:hover { color: var(--accent); }
   .repo-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  /* The "+" new-session action overlays the right edge on hover (zero layout
-     width), same as session rows, so the project name gets the full row. */
+  .repo-name.unread { color: var(--accent); }
   .repo-actions { padding-left: 14px; }
   .repo-new {
     width: 22px; height: 22px;
     display: flex; align-items: center; justify-content: center;
     border-radius: 4px; font-size: 16px; color: var(--text-muted);
-    transition: background 0.15s, color 0.15s;
+    transition: background 0.12s, color 0.12s;
   }
   .repo-new:hover { background: var(--accent-dim); color: var(--accent); }
-  .repo-count {
-    font-size: 10px; background: var(--bg-sidebar-hover); color: var(--text-muted);
-    border-radius: 9px; padding: 1px 7px; flex-shrink: 0;
-  }
-  .repo-group .session-dot { width: 7px; height: 7px; }
-  .session-item.nested { padding-left: 22px; }
-  /* Hierarchy indent guides (file-tree style), cheap on width:
-     - category-body: a guide down the left of all projects in a category
-     - nested session rows: a short guide tying them to their project above */
-  .category-body { border-left: 1px solid var(--border); margin-left: 10px; }
-  .session-item.nested::before {
-    content: ''; position: absolute;
-    left: 16px; top: 0; bottom: 0; width: 1px;
-    background: var(--border);
-  }
-  .session-item.nested.active::before,
-  .session-item.nested.live::before { background: var(--border-light); }
 
-  .category-header {
-    display: flex; align-items: center; gap: 6px;
-    padding: 10px 12px 6px 12px; cursor: pointer; user-select: none;
-    color: var(--text); font-size: 15px; font-weight: 700;
-    text-transform: uppercase; letter-spacing: 0.05em;
-    transition: all 0.15s; border-radius: 4px;
+  /* SESSION (level 3) — same font size, dimmer, one step deeper, no caret. */
+  .session-item.nested { padding-left: var(--tree-sess); }
+
+  /* One guide line down each expanded category, aligned to the PROJECT caret
+     column (a single, consistent vertical rule — not per-row lines). */
+  .category-body { position: relative; }
+  .category-body::before {
+    content: ''; position: absolute;
+    left: calc(var(--tree-proj) - var(--tree-caret) / 2 - 1px);
+    top: 0; bottom: 4px; width: 1px; background: var(--border);
   }
-  .category-header:hover { background: var(--bg-sidebar-hover); }
+
+  /* CATEGORY (level 1) — section header: smallest indent, uppercase label. */
+  .category-header {
+    display: flex; align-items: center; position: relative;
+    padding: 12px 12px 5px var(--tree-cat); cursor: pointer; user-select: none;
+    color: var(--text-muted); font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    transition: color 0.12s; border-radius: 4px;
+  }
+  .category-header:hover { color: var(--text-dim); }
+  .category-header .repo-caret {
+    left: calc(var(--tree-cat) - var(--tree-caret));
+    font-size: 9px;
+  }
   .category-header.drag-over { background: var(--accent-dim); outline: 1px dashed var(--accent); }
-  .category-header.uncat { color: var(--text-muted); font-weight: 500; }
+  .category-header.uncat { color: var(--text-muted); }
   .cat-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cat-del { opacity: 0; color: var(--text-muted); font-size: 15px; transition: all 0.15s; }
+  .cat-del { opacity: 0; color: var(--text-muted); font-size: 14px; transition: all 0.15s; }
   .category-header:hover .cat-del { opacity: 0.5; }
   .cat-del:hover { opacity: 1 !important; color: var(--red); }
-  .cat-rename { opacity: 0; color: var(--text-muted); font-size: 12px; transition: all 0.15s; }
+  .cat-rename { opacity: 0; color: var(--text-muted); font-size: 11px; transition: all 0.15s; margin-left: 4px; }
   .category-header:hover .cat-rename { opacity: 0.5; }
   .cat-rename:hover { opacity: 1 !important; color: var(--accent); }
   .repo-group.dragging { opacity: 0.4; }
   .repo-group.drag-over { background: var(--accent-dim); outline: 1px dashed var(--accent); outline-offset: -1px; }
 
   /* Layer 2: session-history rows (a conversation; live or resumable) */
-  .session-item.hist { padding-top: 7px; padding-bottom: 7px; }
-  .session-item.hist .session-name { font-weight: 400; font-size: 14px; }
+  .session-item.hist { padding-top: 6px; padding-bottom: 6px; }
+  .session-item.hist .session-name { font-weight: 400; font-size: var(--tree-font); }
   .session-item.hist:not(.live) .session-name { color: var(--text-muted); }
   .session-item.hist:not(.live):hover .session-name { color: var(--text-dim); }
   .session-item.hist .session-path { font-size: 11px; opacity: 0.75; }
-  /* hollow dot = a non-running (resumable) conversation */
   .session-dot.hist-dot {
     width: 6px; height: 6px;
     border: 1px solid var(--text-muted); background: transparent; opacity: 0.6;
     box-shadow: none;
   }
-  .conv-loading.nested { padding: 7px 12px 7px 30px; font-size: 11px; color: var(--text-muted); font-style: italic; }
+  .conv-loading.nested { padding: 7px 12px 7px var(--tree-sess); font-size: 11px; color: var(--text-muted); font-style: italic; }
 
   .history-section { color: var(--text-muted); font-size: 11px; }
   .history-item {
@@ -2394,7 +2414,7 @@ function makeHistoryRow(cwd, c, liveName) {
     var s = sessions.find(function(x) { return x.name === liveName; });
     return s && s.activity && lastSeenActivity[liveName] !== undefined && s.activity > lastSeenActivity[liveName];
   })();
-  el.className = 'session-item nested hist' + (isAttached ? ' active' : '') + (isLive ? ' live' : '');
+  el.className = 'session-item nested hist' + (isAttached ? ' active' : '') + (isLive ? ' live' : '') + (isUnread ? ' unread' : '') + (isLive ? '' : ' dead');
   // Title priority: Claude Code's own session name (set via /rename) → webmux
   // display name (for ended sessions Claude can't rename) → summary → the live
   // tmux session name (the name the user typed when creating it, before Claude
@@ -2413,9 +2433,7 @@ function makeHistoryRow(cwd, c, liveName) {
   // Full-text tooltip meta: absolute date + branch + size (size = how much work).
   var tipMeta = [fmtDate(c.mtime), branch ? esc(branch) : '', c.size ? humanSize(c.size) : '']
     .filter(Boolean).join(' · ');
-  var dotClass = isAttached ? 'session-dot active' : (isUnread ? 'session-dot unread' : (isLive ? 'session-dot active' : 'session-dot hist-dot'));
   el.innerHTML =
-    '<span class="' + dotClass + '"></span>' +
     '<div class="session-info">' +
       '<div class="session-name">' + esc(title) + '</div>' +
       '<div class="session-path">' + meta + '</div>' +
@@ -2543,8 +2561,7 @@ function renderProjectList(projects, container, category) {
     header.dataset.cwd = p.cwd;
     header.innerHTML =
       '<span class="repo-caret" title="Expand session history">' + (isCollapsed ? '&#9656;' : '&#9662;') + '</span>' +
-      '<span class="repo-name" title="' + esc(p.cwd) + '">' + esc(p.name) + '</span>' +
-      (p.live.length ? '<span class="session-dot ' + (anyUnread ? 'unread' : 'active') + '"></span>' : '') +
+      '<span class="repo-name' + (anyUnread ? ' unread' : '') + '" title="' + esc(p.cwd) + '">' + esc(p.name) + '</span>' +
       '<span class="row-actions repo-actions"><span class="repo-new" title="New session in this project">&#43;</span></span>';
     // Caret toggles the session-history list; the rest of the row auto-attaches.
     header.querySelector('.repo-caret').onclick = function(e) {
