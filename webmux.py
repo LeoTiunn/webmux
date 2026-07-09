@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.19.0"
+__version__ = "1.19.2"
 
 import asyncio
 import fcntl
@@ -150,20 +150,28 @@ def _looks_like_claude(cmd):
 
 def _resolve_conv_id(cpid, cmd):
     # type: (int, str) -> Optional[str]
-    """Conversation id for a claude pid from its command line (`--resume <id>`).
-
-    This is cheap (no extra syscalls — cmd is already in the ps snapshot) and
-    exact. webmux always starts sessions with `--resume <id>`, so this covers
-    every webmux-created session. Sessions started with `--continue` (or by
-    hand) have no id on the cmdline → return None and let the caller fall back
-    to the name/mtime heuristic. We deliberately do NOT lsof: it was ~0.5s per
-    pane and unreliable for finding the transcript."""
+    """The REAL conversation id a claude pid is on. Ground truth, every launch
+    style (`--resume`, `--continue`, fresh `-n`): Claude writes its live
+    conversation to ~/.claude/sessions/<pid>.json as `sessionId`, keyed by pid.
+    That's authoritative and covers the cases a `--resume <id>` cmdline scan
+    misses (continue/fresh). Falls back to the cmdline id if the file's absent.
+    Cached by pid (a claude process keeps the same conversation for its life)."""
     if cpid in _CONV_ID_CACHE:
         return _CONV_ID_CACHE[cpid]
     conv = None
-    m = re.search(r"--resume\s+(" + _UUID_RE.pattern + r")", cmd)
-    if m:
-        conv = m.group(1)
+    # Primary: Claude's own per-pid session record.
+    try:
+        rec = json.loads((SESSIONS_DIR / (str(cpid) + ".json")).read_text())
+        sid = rec.get("sessionId")
+        if sid and _UUID_RE.fullmatch(sid):
+            conv = sid
+    except (OSError, ValueError):
+        pass
+    # Fallback: `--resume <id>` on the command line.
+    if not conv:
+        m = re.search(r"--resume\s+(" + _UUID_RE.pattern + r")", cmd)
+        if m:
+            conv = m.group(1)
     _CONV_ID_CACHE[cpid] = conv
     return conv
 
@@ -223,6 +231,15 @@ def get_tmux_sessions():
                          int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None))
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    # Claude's own per-session busy/idle flag (from ~/.claude/sessions/<pid>.json).
+    # Index it by the Claude session NAME so we can attach it to each tmux row —
+    # this is the authoritative "agent still working vs finished" signal, far
+    # better than tmux activity (which ticks the whole time output streams).
+    claude_busy = {}  # name -> True if busy
+    for m in session_meta().values():
+        nm = m.get("name")
+        if nm:
+            claude_busy[nm] = (m.get("status") == "busy")
     # Resolve each pane's claude descendant + its conversation id. conv id comes
     # straight from the process command line now (no lsof), so this is cheap.
     sessions = []
@@ -232,7 +249,7 @@ def get_tmux_sessions():
         status = "active" if (hit or "claude" in cmd.lower() or "node" in cmd.lower()) else "idle"
         sessions.append({"name": name, "cwd": cwd, "status": status, "command": cmd,
                          "activity": activity, "branch": git_branch_for(cwd, now),
-                         "conv_id": conv_id})
+                         "conv_id": conv_id, "busy": claude_busy.get(name, False)})
     # Prune conv-id cache entries whose pid is gone (using the same snapshot).
     for dead in [p for p in _CONV_ID_CACHE if p not in procs]:
         del _CONV_ID_CACHE[dead]
@@ -384,10 +401,15 @@ def rename_session(old, new):
 
 def rename_claude_session(tmux_name, new_name):
     # type: (str, str) -> Dict
-    """Rename the Claude Code session running in a live tmux session by sending
-    the `/rename <name>` slash command. Goes through Claude's official path, so
-    it updates ~/.claude/sessions/<pid>.json and the /resume picker. Exits
-    copy-mode first (same wedge guard as send_to_session)."""
+    """Rename a live session, keeping the tmux name and the Claude conversation
+    name IN SYNC (1:1). Two steps:
+      1. `/rename <name>` — Claude's official rename (updates
+         ~/.claude/sessions/<pid>.json + the /resume picker).
+      2. `tmux rename-session` — rename the tmux session to the SAME (sanitized)
+         name so the tmux handle matches the conversation name. This does not
+         detach/reattach; the live connection stays up.
+    Returns the new tmux name so the client can re-point its socket to it."""
+    safe = clean_name(new_name)
     try:
         subprocess.run(["tmux", "send-keys", "-t", tmux_name, "-X", "cancel"],
                        capture_output=True, text=True, timeout=5)
@@ -396,7 +418,16 @@ def rename_claude_session(tmux_name, new_name):
                        check=True, capture_output=True, text=True, timeout=5)
         subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"],
                        check=True, capture_output=True, text=True, timeout=5)
-        return {"ok": True, "name": new_name}
+        # Keep the tmux session name in sync (rename-session doesn't drop the
+        # attach). If the target name is taken, tmux errors — ignore and keep the
+        # old tmux name rather than fail the whole rename.
+        new_tmux = tmux_name
+        if safe and safe != tmux_name:
+            r = subprocess.run(["tmux", "rename-session", "-t", tmux_name, safe],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                new_tmux = safe
+        return {"ok": True, "name": new_name, "tmux": new_tmux}
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         return {"ok": False, "error": str(e)}
 
@@ -758,12 +789,24 @@ async def api_create_session(request):
     branch = body.get("branch") or None
     if not name or not directory:
         return web.json_response({"ok": False, "error": "name and directory required"}, status=400)
-    # Guard against resuming a conversation that ALREADY has a live session:
-    # two `claude --resume <same id>` processes would append the same transcript
-    # and corrupt it. If one exists, return its name so the client just attaches.
-    if resume_id:
+    # Duplicate-session guard. Opening a conversation that ALREADY has a live
+    # session would spawn a SECOND tmux session on the same transcript — two
+    # rows for one conversation (and two `claude` appending the same JSONL).
+    # Figure out which conversation this request would land on and, if a live
+    # session is already on it, just return that session for the client to
+    # attach instead of creating a duplicate.
+    #   - resume_id: the explicit target.
+    #   - not fresh (default CLAUDE_CMD uses `claude --continue`): lands on the
+    #     directory's most-recently-modified conversation.
+    #   - fresh: a genuinely new conversation → never a duplicate, skip.
+    target_conv = resume_id
+    if not target_conv and not fresh:
+        convs = list_conversations(directory, limit=1)  # newest first
+        if convs:
+            target_conv = convs[0]["id"]
+    if target_conv:
         for s in get_tmux_sessions():
-            if s.get("conv_id") == resume_id:
+            if s.get("conv_id") == target_conv:
                 return web.json_response({"ok": True, "name": s["name"], "existing": True})
     result = create_session(name, directory, resume_id=resume_id, fresh=fresh,
                             claude_name=claude_name, branch=branch)
@@ -1250,7 +1293,9 @@ HTML = r"""<!DOCTYPE html>
     --tree-proj: 30px;   /* project name text x   (cat + step) */
     --tree-sess: 46px;   /* session name text x   (proj + step) */
     --tree-caret: 16px;  /* caret slot width */
-    --tree-font: 14px;   /* one font size for the whole tree */
+    --tree-font-base: 14px;           /* one font size for the whole tree… */
+    --tree-font-scale: 1;             /* …scaled by the sidebar A-/A+ control */
+    --tree-font: calc(var(--tree-font-base) * var(--tree-font-scale));
   }
 
   body.light, html.light {
@@ -1332,7 +1377,19 @@ HTML = r"""<!DOCTYPE html>
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.08em;
+    display: flex; align-items: center; justify-content: space-between;
   }
+  /* Font controls stay hidden until you hover the Projects header — font size
+     is a rare tweak, so it shouldn't sit there as permanent visual noise. */
+  .sb-font-controls { display: flex; gap: 2px; opacity: 0; transition: opacity 0.12s; }
+  .sidebar-section:hover .sb-font-controls { opacity: 1; }
+  .sb-font-btn {
+    width: 20px; height: 18px; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; letter-spacing: 0; color: var(--text-muted);
+    cursor: pointer; transition: background 0.12s, color 0.12s;
+  }
+  .sb-font-btn:hover { background: var(--bg-sidebar-hover); color: var(--accent); }
 
   #session-list {
     flex: 1;
@@ -1383,9 +1440,19 @@ HTML = r"""<!DOCTYPE html>
   }
   .session-item.active .session-name { color: var(--text); }
   .session-item:hover .session-name { color: var(--text); }
-  /* Ended (not-live) sessions read dimmed; unread lights the name + pip. */
+  /* Ended (not-live) sessions read dimmed. */
   .session-item.dead .session-name { color: var(--text-muted); }
-  .session-item.unread .session-name { color: var(--accent); }
+  /* Unread (inbox model): new output since you last opened it → a LEADING dot
+     before the name, like an unread email. On the left so it never collides
+     with the rename/kill actions that slide in from the right on hover.
+     Cleared the moment you view the session. */
+  .session-item.unread .session-name::before,
+  .repo-group.unread .repo-name::before {
+    content: ''; display: inline-block;
+    width: 7px; height: 7px; border-radius: 50%; margin-right: 7px;
+    vertical-align: middle;
+    background: var(--accent); box-shadow: 0 0 6px var(--accent-glow);
+  }
   .session-path {
     font-size: 11px; color: var(--text-muted); white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
@@ -1433,7 +1500,17 @@ HTML = r"""<!DOCTYPE html>
     transition: background 0.12s, color 0.12s;
   }
   .repo-group:hover { background: var(--bg-sidebar-hover); }
-  .repo-group.has-active { color: var(--text); }
+  /* Project containing the session you're attached to — accent bar + faint tint
+     is enough to show which project is on the terminal (even when collapsed).
+     No name recolouring: the bar+tint IS the signal, and recolouring the name
+     would just collide with the accent `unread` name. */
+  .repo-group.has-active { background: var(--bg-sidebar-active); }
+  .repo-group.has-active::after {
+    content: ''; position: absolute;
+    left: 0; top: 50%; transform: translateY(-50%);
+    width: 3px; height: 18px;
+    background: var(--accent); border-radius: 0 3px 3px 0;
+  }
   .repo-caret {
     position: absolute; left: calc(var(--tree-proj) - var(--tree-caret));
     top: 50%; transform: translateY(-50%);
@@ -1443,7 +1520,6 @@ HTML = r"""<!DOCTYPE html>
   }
   .repo-caret:hover { color: var(--accent); }
   .repo-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .repo-name.unread { color: var(--accent); }
   .repo-actions { padding-left: 14px; }
   .repo-new {
     width: 22px; height: 22px;
@@ -1544,6 +1620,19 @@ HTML = r"""<!DOCTYPE html>
     background: var(--bg-sidebar-hover);
   }
   .sb-icon.busy { color: var(--accent); }
+
+  /* Unified icon system: every toolbar/status glyph is an inline Lucide-style
+     line SVG (currentColor, one stroke weight + cap), replacing the old mix of
+     emoji + dingbats + ad-hoc SVGs. */
+  svg { display: inline-block; vertical-align: middle; }
+  .sb-icon svg { width: 18px; height: 18px; }
+  .upload-btn svg, #sidebar-toggle svg { width: 15px; height: 15px; }
+  .sb-icon svg, .upload-btn svg, #sidebar-toggle svg {
+    fill: none; stroke: currentColor; stroke-width: 2;
+    stroke-linecap: round; stroke-linejoin: round;
+  }
+  .upload-btn { display: inline-flex; align-items: center; gap: 6px; }
+  .upload-btn.icon-only { gap: 0; }
 
   /* --- Toggle --- */
   #sidebar-toggle {
@@ -1869,21 +1958,27 @@ HTML = r"""<!DOCTYPE html>
       <div class="sidebar-subtitle">tmux in your browser</div>
     </div>
   </div>
-  <div class="sidebar-section">Projects</div>
+  <div class="sidebar-section">
+    <span>Projects</span>
+    <span class="sb-font-controls">
+      <span class="sb-font-btn" onclick="changeSidebarFont(-1)" title="Smaller sidebar text">A-</span>
+      <span class="sb-font-btn" onclick="changeSidebarFont(1)" title="Larger sidebar text">A+</span>
+    </span>
+  </div>
   <div id="session-list"></div>
   <div class="sidebar-section history-section" id="history-header" style="display:none">History</div>
   <div id="history-list"></div>
   <div class="sidebar-bottom">
-    <button class="sb-icon" onclick="openModal()" title="Open project">&#8599;</button>
-    <button class="sb-icon" onclick="newProject()" title="New project">&#43;</button>
-    <button class="sb-icon" onclick="addCategory()" title="New category">&#9712;</button>
-    <button class="sb-icon" id="restart-all-btn" onclick="restartAll()" title="Restart all Claude sessions">&#x21bb;</button>
-    <button class="sb-icon" onclick="toggleSidebar()" title="Hide sidebar">&#x2039;</button>
+    <button class="sb-icon" onclick="openModal()" title="Open project"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
+    <button class="sb-icon" onclick="newProject()" title="New project"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+    <button class="sb-icon" onclick="addCategory()" title="New category"><svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v4M10 13h4"/></svg></button>
+    <button class="sb-icon" id="restart-all-btn" onclick="restartAll()" title="Restart all Claude sessions"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg></button>
+    <button class="sb-icon" onclick="toggleSidebar()" title="Hide sidebar"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
   </div>
 </div>
 
 <div id="main-area">
-  <div id="sidebar-toggle" onclick="toggleSidebar()" title="Show sidebar">&#x203A;</div>
+  <div id="sidebar-toggle" onclick="toggleSidebar()" title="Show sidebar"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></div>
   <div id="terminal-container"></div>
   <div id="drop-overlay"><span class="drop-text">Drop files to attach</span></div>
   <input type="file" id="file-input" multiple />
@@ -1903,15 +1998,15 @@ HTML = r"""<!DOCTYPE html>
       <span class="mkey" onclick="sendKey('\x1b[B')">↓</span>
     </span>
     <span style="flex:1"></span>
-    <span class="upload-btn" onclick="document.getElementById('file-input').click()" title="Attach files">&#128206; attach</span>
+    <span class="upload-btn" onclick="document.getElementById('file-input').click()" title="Attach files"><svg viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg><span class="btn-label">attach</span></span>
     <span class="font-controls">
       <span class="font-btn" onclick="changeFontSize(-1)" title="Smaller (Ctrl+-)">A-</span>
       <span id="font-size-display">18</span>
       <span class="font-btn" onclick="changeFontSize(1)" title="Larger (Ctrl+=)">A+</span>
     </span>
     <span id="term-size">—</span>
-    <span id="theme-toggle" class="upload-btn" onclick="toggleTheme()" title="Toggle theme"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg></span>
-    <a href="/settings" class="upload-btn" title="Settings" style="text-decoration:none">&#9881;</a>
+    <span id="theme-toggle" class="upload-btn icon-only" onclick="toggleTheme()" title="Toggle theme"><svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg></span>
+    <a href="/settings" class="upload-btn icon-only" title="Settings" style="text-decoration:none"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>
   </div>
 </div>
 
@@ -2259,6 +2354,13 @@ function loadSessions() {
     .then(function(r) { return r.json(); })
     .then(function(data) {
       sessions = data;
+      // Inbox baseline: the first time we ever see a session, record its current
+      // activity as "seen" — so it starts read, and only NEW output after that
+      // marks it unread. (Without this, lastSeenActivity stays undefined and the
+      // unread dot never fires.) The attached session is always kept read.
+      data.forEach(function(s) {
+        if (lastSeenActivity[s.name] === undefined) lastSeenActivity[s.name] = s.activity || 0;
+      });
       if (activeSession) {
         var cur = data.find(function(s) { return s.name === activeSession; });
         if (cur) lastSeenActivity[activeSession] = cur.activity || 0;
@@ -2368,14 +2470,19 @@ function attachTip(el, nameHtml, metaHtml) {
   });
 }
 
-// Map live tmux sessions in a project to conversation ids.
-// Pass 0: session.conv_id — the REAL conversation the pane's claude process is
-//   on, resolved server-side from the process (ps --resume id / lsof open jsonl).
-//   This is ground truth; when present it always wins, immune to renames and
-//   mtime churn (the cause of sessions showing the wrong conversation).
-// Pass 1 (fallback): session named "<name>-<6hex>" → conversation id prefix.
-// Pass 2 (fallback): remaining live session → newest unclaimed conversation.
-// Leftover live sessions (no conv to claim) returned separately.
+// Map live tmux sessions in a project to conversation ids. TWO passes only —
+// both EXACT. No mtime guessing: an unmatched session is shown as itself (its
+// tmux name, via leftover), never fused onto some other conversation.
+//   Pass 0: session.conv_id — the REAL conversation the pane's claude process
+//     is on (backend reads it from `claude --resume <id>` on the cmdline). Ground
+//     truth; immune to renames and mtime churn.
+//   Pass 1: session named "<name>-<6hex>" → conversation whose id starts with
+//     that hex (how webmux names sessions it resumes).
+// Anything still unmatched — a fresh `claude -n` / `--continue` session that
+// has no id on its cmdline and no matching conversation yet — goes to leftover
+// and renders under its own tmux name. Previously a mtime "newest unclaimed"
+// Pass 2 fused these onto an unrelated old conversation (showing the wrong name
+// + size), which is the mismatch bug this removes.
 function mapLiveToConv(live, convs) {
   var map = {}, claimed = {}, leftover = [], mapped = {};
   // Pass 0 — authoritative conv_id from the backend.
@@ -2384,7 +2491,7 @@ function mapLiveToConv(live, convs) {
     var hit = convs.find(function(c) { return c.id === s.conv_id && !claimed[c.id]; });
     if (hit) { map[hit.id] = s.name; claimed[hit.id] = true; mapped[s.name] = true; }
   });
-  // Pass 1 — legacy "-<6hex>" suffix heuristic (only for sessions still unmapped).
+  // Pass 1 — exact "-<6hex>" suffix match (only for sessions still unmapped).
   live.forEach(function(s) {
     if (mapped[s.name]) return;
     var m = s.name.match(/-([0-9a-f]{6})$/i);
@@ -2392,12 +2499,9 @@ function mapLiveToConv(live, convs) {
     var hit = convs.find(function(c) { return c.id.slice(0, 6) === m[1].toLowerCase() && !claimed[c.id]; });
     if (hit) { map[hit.id] = s.name; claimed[hit.id] = true; mapped[s.name] = true; }
   });
-  // Pass 2 — last-resort newest-unclaimed guess.
+  // Unmatched → leftover (rendered as its own tmux name). No mtime guessing.
   live.forEach(function(s) {
-    if (mapped[s.name]) return;
-    var hit = convs.find(function(c) { return !claimed[c.id]; });
-    if (hit) { map[hit.id] = s.name; claimed[hit.id] = true; mapped[s.name] = true; }
-    else leftover.push(s);
+    if (!mapped[s.name]) leftover.push(s);
   });
   return {byConv: map, leftover: leftover};
 }
@@ -2410,9 +2514,13 @@ function makeHistoryRow(cwd, c, liveName) {
   var el = document.createElement('div');
   var isAttached = liveName && liveName === activeSession;
   var isLive = !!liveName;
+  // Unread = inbox model: this live session produced new output since you last
+  // viewed it, you're not viewing it now, AND the agent has FINISHED (Claude's
+  // own status is idle, not busy) — so the dot means "a completed answer is
+  // waiting", not "still typing". Cleared when you open it.
   var isUnread = isLive && !isAttached && (function() {
     var s = sessions.find(function(x) { return x.name === liveName; });
-    return s && s.activity && lastSeenActivity[liveName] !== undefined && s.activity > lastSeenActivity[liveName];
+    return s && !s.busy && s.activity && lastSeenActivity[liveName] !== undefined && s.activity > lastSeenActivity[liveName];
   })();
   el.className = 'session-item nested hist' + (isAttached ? ' active' : '') + (isLive ? ' live' : '') + (isUnread ? ' unread' : '') + (isLive ? '' : ' dead');
   // Title priority: Claude Code's own session name (set via /rename) → webmux
@@ -2474,6 +2582,13 @@ function renameSessionRow(cwd, c, liveName) {
       body: JSON.stringify({tmux: liveName, name: name})
     }).then(function(r) { return r.json(); }).then(function(d) {
       if (!d.ok) { alert('Rename failed: ' + (d.error || 'unknown')); return; }
+      // The tmux session was renamed too (kept in sync). If we were attached to
+      // it under the old name, re-point our socket to the new tmux name.
+      if (d.tmux && d.tmux !== liveName && activeSession === liveName) {
+        activeSession = d.tmux;
+        localStorage.setItem('webmux-last-session', d.tmux);
+        location.hash = encodeURIComponent(d.tmux);
+      }
       // Claude writes the name async; refresh shortly to pick it up.
       setTimeout(function() { delete convCache[cwd]; loadSessions(); }, 800);
     });
@@ -2550,18 +2665,21 @@ function renderProjectList(projects, container, category) {
   var collapsed = getCollapsed();
   projects.forEach(function(p) {
     var hasActive = p.live.some(function(s) { return s.name === activeSession; });
+    // Project shows the unread dot when any of its live sessions has new output
+    // since you last viewed it — so a COLLAPSED project still tells you there's
+    // something to read inside (you'd never expand it otherwise).
     var anyUnread = p.live.some(function(s) {
-      return s.name !== activeSession && s.activity && lastSeenActivity[s.name] !== undefined && s.activity > lastSeenActivity[s.name];
+      return s.name !== activeSession && !s.busy && s.activity && lastSeenActivity[s.name] !== undefined && s.activity > lastSeenActivity[s.name];
     });
     var isCollapsed = (p.cwd in collapsed) ? collapsed[p.cwd] : !hasActive;
 
     var header = document.createElement('div');
-    header.className = 'repo-group' + (isCollapsed ? ' collapsed' : '') + (hasActive ? ' has-active' : '');
+    header.className = 'repo-group' + (isCollapsed ? ' collapsed' : '') + (hasActive ? ' has-active' : '') + (anyUnread ? ' unread' : '');
     header.draggable = true;
     header.dataset.cwd = p.cwd;
     header.innerHTML =
       '<span class="repo-caret" title="Expand session history">' + (isCollapsed ? '&#9656;' : '&#9662;') + '</span>' +
-      '<span class="repo-name' + (anyUnread ? ' unread' : '') + '" title="' + esc(p.cwd) + '">' + esc(p.name) + '</span>' +
+      '<span class="repo-name" title="' + esc(p.cwd) + '">' + esc(p.name) + '</span>' +
       '<span class="row-actions repo-actions"><span class="repo-new" title="New session in this project">&#43;</span></span>';
     // Caret toggles the session-history list; the rest of the row auto-attaches.
     header.querySelector('.repo-caret').onclick = function(e) {
@@ -2615,22 +2733,35 @@ function renderProjectList(projects, container, category) {
       container.appendChild(loading);
       return;
     }
-    var liveMap = mapLiveToConv(p.live, convs);
-    // Live sessions first, then past/resumable — but DO NOT reorder within the
-    // live group when you attach. Each row stays exactly where it is; attaching
-    // only adds the highlight/dot. `convs` is the stable source order (only
-    // changes when a NEW conversation appears), so a session never jumps slot.
-    var liveRows = [], pastRows = [];
+    // LIVE rows = the project's live tmux sessions, shown faithfully as-is
+    // (tmux session name, click → attach). No conversation matching, no guessing,
+    // no de-duping: what tmux has is what you see. A session carries its resolved
+    // conversation (conv_id) only to enrich the row with that convo's summary/
+    // size/branch when available.
+    var convById = {};
+    convs.forEach(function(c) { convById[c.id] = c; });
+    var liveConvIds = {}, seenConv = {};
+    p.live.forEach(function(s) {
+      var c = s.conv_id && convById[s.conv_id];
+      // Enforce 1:1 — a conversation shows ONE row even if two tmux sessions
+      // happen to be on it (attach the first/most-relevant; the dup is hidden).
+      if (c) {
+        if (seenConv[c.id]) return;
+        seenConv[c.id] = true;
+        liveConvIds[c.id] = true;
+      }
+      // Row is the SESSION. If we know its conversation, borrow that convo's
+      // metadata; otherwise show the session's own name/activity.
+      var row = c ? {id: c.id, claude_name: c.claude_name, summary: c.summary,
+                     branch: c.branch, size: c.size, mtime: c.mtime}
+                  : {id: s.name, summary: s.name, mtime: s.activity || 0,
+                     branch: s.branch || '', size: 0};
+      container.appendChild(makeHistoryRow(p.cwd, row, s.name));
+    });
+    // PAST rows = conversations with no live session on them → click to resume.
     convs.forEach(function(c) {
-      var ln = liveMap.byConv[c.id] || null;
-      (ln ? liveRows : pastRows).push({c: c, ln: ln});
+      if (!liveConvIds[c.id]) container.appendChild(makeHistoryRow(p.cwd, c, null));
     });
-    // Leftover live sessions (no matching conversation, e.g. plain shell).
-    liveMap.leftover.forEach(function(s) {
-      liveRows.push({c: {id: s.name, summary: s.name, mtime: s.activity || 0, branch: s.branch || '', size: 0}, ln: s.name});
-    });
-    liveRows.forEach(function(r) { container.appendChild(makeHistoryRow(p.cwd, r.c, r.ln)); });
-    pastRows.forEach(function(r) { container.appendChild(makeHistoryRow(p.cwd, r.c, r.ln)); });
   });
 }
 
@@ -3061,6 +3192,19 @@ function changeFontSize(delta) {
     if (fitAddon) fitAddon.fit();
   }
 }
+
+// Sidebar text size — independent of the terminal font. Scales every tree
+// level together via the --tree-font-scale CSS var (0.8×–1.4×), persisted.
+var sidebarFontScale = parseFloat(localStorage.getItem('webmux-sidebar-scale') || '1');
+function applySidebarFont() {
+  document.documentElement.style.setProperty('--tree-font-scale', sidebarFontScale);
+}
+function changeSidebarFont(dir) {
+  sidebarFontScale = Math.max(0.8, Math.min(1.4, Math.round((sidebarFontScale + dir * 0.1) * 10) / 10));
+  localStorage.setItem('webmux-sidebar-scale', sidebarFontScale);
+  applySidebarFont();
+}
+applySidebarFont();
 
 
 function updateTerminalTheme(isLight) {
