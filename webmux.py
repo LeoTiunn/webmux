@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.18.0"
+__version__ = "1.18.1"
 
 import asyncio
 import fcntl
@@ -2553,7 +2553,13 @@ function renderProjectList(projects, container, category) {
       var nowCollapsed = !isCollapsed;
       c[p.cwd] = nowCollapsed;
       setCollapsed(c);
-      if (!nowCollapsed) loadConversations(p.cwd); else renderSessions();
+      // Re-render IMMEDIATELY so the caret flips and the row expands/collapses
+      // on click — don't wait for the /api/conversations fetch. Expanding also
+      // kicks off loadConversations(), which re-renders again once the history
+      // arrives. (Previously expand only re-rendered inside the fetch callback,
+      // so a cold expand felt laggy and a cached one didn't visibly respond.)
+      if (!nowCollapsed) loadConversations(p.cwd);
+      renderSessions();
     };
     // + → spawn a fresh claude session in this project's cwd (no resume).
     header.querySelector('.repo-new').onclick = function(e) {
