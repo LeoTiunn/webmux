@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.19.3"
+__version__ = "1.20.0"
 
 import asyncio
 import fcntl
@@ -172,7 +172,11 @@ def _resolve_conv_id(cpid, cmd):
         m = re.search(r"--resume\s+(" + _UUID_RE.pattern + r")", cmd)
         if m:
             conv = m.group(1)
-    _CONV_ID_CACHE[cpid] = conv
+    # Only cache a POSITIVE result. A miss (e.g. sessions/<pid>.json not written
+    # yet right after launch) must be re-tried next sweep, or the session is
+    # stuck showing its tmux name instead of the Claude conversation name.
+    if conv:
+        _CONV_ID_CACHE[cpid] = conv
     return conv
 
 
@@ -231,25 +235,22 @@ def get_tmux_sessions():
                          int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None))
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    # Claude's own per-session busy/idle flag (from ~/.claude/sessions/<pid>.json).
-    # Index it by the Claude session NAME so we can attach it to each tmux row —
-    # this is the authoritative "agent still working vs finished" signal, far
-    # better than tmux activity (which ticks the whole time output streams).
-    claude_busy = {}  # name -> True if busy
-    for m in session_meta().values():
-        nm = m.get("name")
-        if nm:
-            claude_busy[nm] = (m.get("status") == "busy")
-    # Resolve each pane's claude descendant + its conversation id. conv id comes
-    # straight from the process command line now (no lsof), so this is cheap.
+    # Claude Code's own session registry (~/.claude/sessions/<pid>.json), keyed by
+    # sessionId. This is THE source of truth for a session's display name and its
+    # busy/idle status — webmux shows the CC conversation name, not the tmux name.
+    meta_by_sid = session_meta()
+    # Resolve each pane's claude descendant + its conversation id (from the
+    # process, cheap). Then look up the CC name/status by that conversation id.
     sessions = []
     for (name, cwd, cmd, activity, pane_pid) in rows:
         hit = _claude_descendant(pane_pid, procs)
         conv_id = _resolve_conv_id(hit[0], hit[1]) if hit else None
         status = "active" if (hit or "claude" in cmd.lower() or "node" in cmd.lower()) else "idle"
+        m = meta_by_sid.get(conv_id, {}) if conv_id else {}
         sessions.append({"name": name, "cwd": cwd, "status": status, "command": cmd,
                          "activity": activity, "branch": git_branch_for(cwd, now),
-                         "conv_id": conv_id, "busy": claude_busy.get(name, False)})
+                         "conv_id": conv_id, "busy": (m.get("status") == "busy"),
+                         "claude_name": m.get("name", "")})
     # Prune conv-id cache entries whose pid is gone (using the same snapshot).
     for dead in [p for p in _CONV_ID_CACHE if p not in procs]:
         del _CONV_ID_CACHE[dead]
@@ -385,49 +386,6 @@ def kill_session(name):
         subprocess.run(["tmux", "kill-session", "-t", name],
                        check=True, capture_output=True, text=True, timeout=5)
         return {"ok": True}
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        return {"ok": False, "error": str(e)}
-
-
-def rename_session(old, new):
-    # type: (str, str) -> Dict
-    try:
-        subprocess.run(["tmux", "rename-session", "-t", old, new],
-                       check=True, capture_output=True, text=True, timeout=5)
-        return {"ok": True, "name": new}
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        return {"ok": False, "error": str(e)}
-
-
-def rename_claude_session(tmux_name, new_name):
-    # type: (str, str) -> Dict
-    """Rename a live session, keeping the tmux name and the Claude conversation
-    name IN SYNC (1:1). Two steps:
-      1. `/rename <name>` — Claude's official rename (updates
-         ~/.claude/sessions/<pid>.json + the /resume picker).
-      2. `tmux rename-session` — rename the tmux session to the SAME (sanitized)
-         name so the tmux handle matches the conversation name. This does not
-         detach/reattach; the live connection stays up.
-    Returns the new tmux name so the client can re-point its socket to it."""
-    safe = clean_name(new_name)
-    try:
-        subprocess.run(["tmux", "send-keys", "-t", tmux_name, "-X", "cancel"],
-                       capture_output=True, text=True, timeout=5)
-        # Type the slash command literally, then submit with Enter.
-        subprocess.run(["tmux", "send-keys", "-l", "-t", tmux_name, "/rename " + new_name],
-                       check=True, capture_output=True, text=True, timeout=5)
-        subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"],
-                       check=True, capture_output=True, text=True, timeout=5)
-        # Keep the tmux session name in sync (rename-session doesn't drop the
-        # attach). If the target name is taken, tmux errors — ignore and keep the
-        # old tmux name rather than fail the whole rename.
-        new_tmux = tmux_name
-        if safe and safe != tmux_name:
-            r = subprocess.run(["tmux", "rename-session", "-t", tmux_name, safe],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode == 0:
-                new_tmux = safe
-        return {"ok": True, "name": new_name, "tmux": new_tmux}
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         return {"ok": False, "error": str(e)}
 
@@ -820,32 +778,6 @@ async def api_kill_session(request):
         return web.json_response({"ok": False, "error": "name required"}, status=400)
     result = kill_session(name)
     return web.json_response(result, status=200 if result["ok"] else 500)
-
-async def api_rename_session(request):
-    if not check_auth(request):
-        return web.json_response({"error": "unauthorized"}, status=401)
-    data = await request.json()
-    old = data.get("old", "")
-    new = data.get("new", "")
-    if not old or not new:
-        return web.json_response({"ok": False, "error": "old and new required"}, status=400)
-    result = rename_session(old, new)
-    return web.json_response(result, status=200 if result["ok"] else 500)
-
-async def api_rename_claude(request):
-    # Rename the Claude Code session in a live tmux session via `/rename`.
-    if not check_auth(request):
-        return web.json_response({"error": "unauthorized"}, status=401)
-    data = await request.json()
-    tmux_name = data.get("tmux", "")
-    new_name = (data.get("name", "") or "").strip()
-    if not tmux_name or not new_name:
-        return web.json_response({"ok": False, "error": "tmux and name required"}, status=400)
-    # Claude session names: no spaces in the resume key, keep it sane.
-    new_name = new_name.replace("\n", " ").strip()
-    result = await asyncio.get_event_loop().run_in_executor(
-        None, rename_claude_session, tmux_name, new_name)
-    return web.json_response(result, status=200 if result.get("ok") else 500)
 
 async def api_restart_all(request):
     if not check_auth(request):
@@ -1479,13 +1411,6 @@ HTML = r"""<!DOCTYPE html>
     transition: background 0.15s, color 0.15s; flex-shrink: 0;
   }
   .session-kill:hover { background: var(--red-dim); color: var(--red); }
-  .session-rename {
-    width: 22px; height: 18px; border-radius: 4px;
-    display: flex; align-items: center; justify-content: center;
-    color: var(--text-muted); font-size: 11px; cursor: pointer;
-    transition: background 0.15s, color 0.15s; flex-shrink: 0;
-  }
-  .session-rename:hover { background: var(--accent-dim); color: var(--accent); }
 
   /* ===== Sidebar tree (VS Code-style): CATEGORY > PROJECT > SESSION =====
      Even indent staircase, carets absolutely positioned, one font size, one
@@ -2554,7 +2479,6 @@ function makeHistoryRow(cwd, c, liveName) {
       '<div class="session-path">' + meta + '</div>' +
     '</div>' +
     '<span class="row-actions">' +
-      '<span class="session-rename" title="Rename session">&#9998;</span>' +
       '<span class="session-kill" title="' + (isLive ? 'Kill session' : 'Delete conversation') + '">&times;</span>' +
     '</span>';
   var info = el.querySelector('.session-info');
@@ -2563,53 +2487,14 @@ function makeHistoryRow(cwd, c, liveName) {
     else resumeConversation(cwd, c.id);
   };
   attachTip(info, esc(title), tipMeta);
-  var doRename = function(e) { e.stopPropagation(); renameSessionRow(cwd, c, liveName); };
-  el.querySelector('.session-name').ondblclick = doRename;
-  el.querySelector('.session-rename').onclick = doRename;
+  // No webmux rename: names are Claude Code's. Rename a session with `/rename`
+  // in the terminal; webmux reflects the new name on the next refresh.
   if (isLive) {
     el.querySelector('.session-kill').onclick = function(e) { e.stopPropagation(); showConfirm(liveName, e.target); };
   } else {
     el.querySelector('.session-kill').onclick = function(e) { e.stopPropagation(); showDeleteConv(cwd, c, e.target); };
   }
   return el;
-}
-
-// Rename a session. LIVE → send Claude's official `/rename` (updates Claude Code
-// itself + /resume picker). ENDED (no live tmux) → store a webmux display name,
-// since Claude can't rename a session that isn't running.
-function renameSessionRow(cwd, c, liveName) {
-  var cur = c.claude_name || (groupCfg.names && groupCfg.names[c.id]) || c.summary || c.id.slice(0, 8);
-  var name = prompt('Session name:', cur);
-  if (name === null) return;
-  name = name.trim();
-  if (liveName) {
-    if (!name) return;
-    fetch('/api/sessions/rename-claude', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({tmux: liveName, name: name})
-    }).then(function(r) { return r.json(); }).then(function(d) {
-      if (!d.ok) { alert('Rename failed: ' + (d.error || 'unknown')); return; }
-      // The tmux session was renamed too (kept in sync). If we were attached to
-      // it under the old name, re-point our socket to the new tmux name.
-      if (d.tmux && d.tmux !== liveName && activeSession === liveName) {
-        activeSession = d.tmux;
-        localStorage.setItem('webmux-last-session', d.tmux);
-        location.hash = encodeURIComponent(d.tmux);
-      }
-      // Refresh immediately so the row reflects the new name right away, then
-      // again after Claude finishes its async write (so the conversation's
-      // claude_name catches up). The name-based PAST-row suppression prevents a
-      // duplicate row in the gap between the two.
-      delete convCache[cwd]; loadSessions();
-      setTimeout(function() { delete convCache[cwd]; loadSessions(); }, 900);
-    });
-  } else {
-    if (!groupCfg.names) groupCfg.names = {};
-    if (name) groupCfg.names[c.id] = name;
-    else delete groupCfg.names[c.id];
-    saveGroups();
-    renderSessions();
-  }
 }
 
 function getCollapsed() {
@@ -2734,57 +2619,22 @@ function renderProjectList(projects, container, category) {
     container.appendChild(header);
     if (isCollapsed) return;
 
-    // Layer 2: session history for this project.
-    var convs = convCache[p.cwd];
-    if (convs === undefined) {
-      loadConversations(p.cwd);
-      var loading = document.createElement('div');
-      loading.className = 'conv-loading nested';
-      loading.textContent = 'Loading…';
-      container.appendChild(loading);
-      return;
-    }
-    // LIVE rows = the project's live tmux sessions, shown faithfully as-is
-    // (tmux session name, click → attach). No conversation matching, no guessing,
-    // no de-duping: what tmux has is what you see. A session carries its resolved
-    // conversation (conv_id) only to enrich the row with that convo's summary/
-    // size/branch when available.
-    var convById = {};
-    convs.forEach(function(c) { convById[c.id] = c; });
-    // Sanitized names of live sessions — used to suppress a duplicate PAST row
-    // during the brief window after a rename where conv_id hasn't re-resolved
-    // yet (tmux name and conversation name are kept in sync, so the sanitized
-    // forms match even before conv_id catches up).
-    var liveNameKeys = {};
-    p.live.forEach(function(s) { liveNameKeys[treeCleanName(s.name)] = true; });
-    var liveConvIds = {}, seenConv = {}, seenSess = {};
+    // Layer 2: ONE row per live tmux session — 1:1, no conversation matching.
+    // webmux tracks SESSIONS; switching between a session's conversations is
+    // Claude Code's own job (press ← in the terminal). This is why the whole
+    // conv_id-guessing / mtime / leftover / past-conversation machinery is gone:
+    // a session is a session, shown by its Claude name (falls back to tmux name).
+    var seenSess = {};
     p.live.forEach(function(s) {
-      if (seenSess[s.name]) return;          // one row per tmux session, always
+      if (seenSess[s.name]) return;          // defensive: one row per tmux session
       seenSess[s.name] = true;
-      var c = s.conv_id && convById[s.conv_id];
-      // Enforce 1:1 — a conversation shows ONE row even if two tmux sessions
-      // happen to be on it (attach the first/most-relevant; the dup is hidden).
-      if (c) {
-        if (seenConv[c.id]) return;
-        seenConv[c.id] = true;
-        liveConvIds[c.id] = true;
-      }
-      // Row is the SESSION. If we know its conversation, borrow that convo's
-      // metadata; otherwise show the session's own name/activity.
-      var row = c ? {id: c.id, claude_name: c.claude_name, summary: c.summary,
-                     branch: c.branch, size: c.size, mtime: c.mtime}
-                  : {id: s.name, summary: s.name, mtime: s.activity || 0,
-                     branch: s.branch || '', size: 0};
+      var row = {id: s.name,
+                 claude_name: s.claude_name || '',
+                 summary: s.name,
+                 branch: s.branch || '',
+                 mtime: s.activity || 0,
+                 size: 0};
       container.appendChild(makeHistoryRow(p.cwd, row, s.name));
-    });
-    // PAST rows = conversations with NO live session on them → click to resume.
-    // Exclude by conv_id AND by sanitized-name (covers the post-rename window
-    // before conv_id re-resolves, so the just-renamed session never doubles).
-    convs.forEach(function(c) {
-      if (liveConvIds[c.id]) return;
-      var nm = c.claude_name || (groupCfg.names && groupCfg.names[c.id]) || c.summary || '';
-      if (nm && liveNameKeys[treeCleanName(nm)]) return;
-      container.appendChild(makeHistoryRow(p.cwd, c, null));
     });
   });
 }
@@ -3495,8 +3345,6 @@ def _build_app():
     app.router.add_get("/api/messages", api_messages)
     app.router.add_post("/api/sessions/create", api_create_session)
     app.router.add_post("/api/projects/create", api_create_project)
-    app.router.add_post("/api/sessions/rename", api_rename_session)
-    app.router.add_post("/api/sessions/rename-claude", api_rename_claude)
     app.router.add_delete("/api/sessions/{name}", api_kill_session)
     app.router.add_post("/api/upload", api_upload)
     app.router.add_post("/api/sessions/restart-all", api_restart_all)
