@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.20.0"
+__version__ = "1.20.1"
 
 import asyncio
 import fcntl
@@ -880,6 +880,24 @@ async def api_groups(request):
             pass
     return web.json_response({"categories": [], "assign": {}})
 
+def _validate_pem(raw, kind):
+    """Sanity-check an uploaded cert/key BEFORE it replaces the live one — a
+    broken cert makes the HTTPS listener fail to bind on restart and locks out
+    remote access with no easy recovery. Returns (ok, error_message)."""
+    text = raw.decode("utf-8", "replace")
+    marker = "BEGIN CERTIFICATE" if kind == "cert" else "PRIVATE KEY"
+    if marker not in text:
+        return False, ("not a PEM certificate" if kind == "cert" else "not a PEM private key")
+    try:
+        args = ["openssl", "x509", "-noout"] if kind == "cert" else ["openssl", "pkey", "-noout"]
+        r = subprocess.run(args, input=raw, capture_output=True, timeout=5)
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return True, ""  # openssl unavailable — header check already passed, don't block
+    if r.returncode != 0:
+        return False, ("invalid or corrupt certificate" if kind == "cert"
+                       else "invalid or corrupt private key")
+    return True, ""
+
 async def handle_settings(request):
     if request.method == "POST":
         data = await request.post()
@@ -900,21 +918,53 @@ async def handle_settings(request):
             lines = [l for l in lines if not l.startswith(f"{key}=")]
             if val:
                 lines.append(f"{key}={val}")
-        for file_key, env_key in [("cert_file", "WEBMUX_CERT"), ("key_file", "WEBMUX_KEY")]:
+        cert_errors = []
+        for file_key, env_key, kind in [("cert_file", "WEBMUX_CERT", "cert"),
+                                         ("key_file", "WEBMUX_KEY", "key")]:
             upload = data.get(file_key)
             if upload and hasattr(upload, "file") and upload.filename:
+                raw = upload.file.read()
+                ok, err = _validate_pem(raw, kind)
+                if not ok:
+                    # Reject a bad upload outright — writing it would break the
+                    # HTTPS listener on restart and lock out remote access.
+                    cert_errors.append(f"{upload.filename}: {err}")
+                    continue
                 dest = CONFIG_DIR / upload.filename
-                dest.write_bytes(upload.file.read())
+                dest.write_bytes(raw)
+                if kind == "key":
+                    try: dest.chmod(0o600)
+                    except OSError: pass
                 lines = [l for l in lines if not l.startswith(f"{env_key}=")]
                 lines.append(f"{env_key}={dest}")
+        if cert_errors:
+            # Don't touch env or restart — surface the error and keep serving.
+            def _esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+            err_html = ('<div class="settings-msg" style="background:rgba(224,85,85,0.12);'
+                        'color:#e05555">Not saved — ' + "; ".join(_esc(e) for e in cert_errors)
+                        + '</div>')
+            return web.Response(text=_settings_html(err_html), content_type="text/html")
         env_file.write_text("\n".join(lines) + "\n")
         import threading
         def _delayed_restart():
             import time; time.sleep(1)
-            subprocess.Popen(["open", "/Applications/Webmux.app"])
+            # Relaunch the standalone .app if present (bundled install); brew/launchd
+            # installs have no such app and rely on launchd to respawn after exit.
+            app = "/Applications/Webmux.app"
+            if os.path.isdir(app):
+                subprocess.Popen(["open", app])
             os._exit(0)
         threading.Thread(target=_delayed_restart, daemon=True).start()
-        return web.Response(text=_settings_html('<div class="settings-msg">Saved. Restarting...</div>'),
+        # The server exits and launchd/app relaunches it; the page that POSTed is
+        # now talking to a dead process, so poll until the new one answers and then
+        # reload — otherwise it hangs on "Restarting..." forever.
+        restart_msg = ('<div class="settings-msg">Saved. Restarting…</div>'
+                       '<script>(function(){'
+                       'function ping(){fetch(location.origin+"/settings",{cache:"no-store"})'
+                       '.then(function(r){if(r.ok){location.href=location.origin;}else{setTimeout(ping,1000);}})'
+                       '.catch(function(){setTimeout(ping,1000);});}'
+                       'setTimeout(ping,2000);})();</script>')
+        return web.Response(text=_settings_html(restart_msg),
                             content_type="text/html")
     return web.Response(text=_settings_html(), content_type="text/html")
 
