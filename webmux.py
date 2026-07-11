@@ -2,7 +2,7 @@
 """webmux — Browser-based tmux terminal client.
 Full xterm.js terminal emulator connected to tmux sessions via WebSocket."""
 
-__version__ = "1.20.1"
+__version__ = "1.20.2"
 
 import asyncio
 import fcntl
@@ -1241,6 +1241,7 @@ HTML = r"""<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-canvas@0.7.0/lib/addon-canvas.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-clipboard@0.1.0/lib/addon-clipboard.min.js"></script>
 <script>if(localStorage.getItem('webmux-theme')==='light')document.documentElement.classList.add('light');</script>
 <style>
   :root {
@@ -2102,6 +2103,19 @@ function initTerminal() {
   fitAddon = new FitAddon.FitAddon();
   term.loadAddon(fitAddon);
   try { term.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch(e) {}
+
+  // Remote-only: enable xterm's OSC 52 clipboard handling. Locally you copy by
+  // mouse-selecting (native, secure localhost), so we leave that path untouched.
+  // Over a remote origin the terminal has no selectable DOM text (Claude Code's
+  // fullscreen renderer paints to a canvas), but tmux/CC still emit the selection
+  // as an OSC 52 sequence on mouse-select. This addon is what turns that into
+  // navigator.clipboard.writeText — without it xterm 5.x drops OSC 52 entirely,
+  // which is why remote copy silently did nothing before.
+  var _h = location.hostname;
+  var _isLocal = (_h === 'localhost' || _h === '127.0.0.1' || _h === '[::1]');
+  if (!_isLocal && window.ClipboardAddon) {
+    try { term.loadAddon(new ClipboardAddon.ClipboardAddon()); } catch(e) {}
+  }
 
   if (document.body.classList.contains('light')) updateTerminalTheme(true);
 
