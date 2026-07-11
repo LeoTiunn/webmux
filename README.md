@@ -6,7 +6,7 @@ Browser-based tmux terminal client.
 
 Claude Code runs in the terminal — close the terminal and the session is gone. tmux solves this by keeping sessions alive in the background, but it introduces new problems: no scrollback visibility, no easy way to manage multiple sessions or agents, and a clunky workflow switching between them.
 
-webmux gives you a browser UI on top of tmux, organized around your **Claude Code sessions**: projects grouped into categories, each project expandable to its full Claude session history (resume any past conversation, or reconnect to a live one), rename sessions, native text selection, and drag-and-drop file upload. Built for engineers running many Claude Code agents in parallel. Desktop is the primary experience; mobile works for remote viewing and light interaction.
+webmux gives you a browser UI on top of tmux, organized around your **Claude Code sessions**: projects grouped into categories, one row per live session showing its Claude conversation name, a command palette to jump to any conversation, native text selection and scroll, and drag-and-drop file upload. Built for engineers running many Claude Code agents in parallel. Desktop is the primary experience; mobile works for remote viewing and light interaction.
 
 ## Install
 
@@ -57,11 +57,11 @@ renderer back.
 ## Features
 
 - **Projects** — sidebar groups live-tmux repos by name; drag to reorder or into custom categories (synced server-side). Click a project to attach its latest session.
-- **Session history** — expand a project to see every Claude conversation (newest first, with time · branch · size). Live sessions float to the top; click to reconnect, or click a past one to `claude --resume` it.
-- **Rename** — rename a live session via Claude's own `/rename` (syncs to the `/resume` picker); past sessions get a webmux-side display name.
+- **Sessions, 1:1** — one row per live tmux session; the row shows its Claude Code conversation name (read live from Claude's own session registry). Switch between a session's conversations with Claude Code's `←` key in the terminal — webmux just reflects the current one faithfully. Rename with Claude's `/rename`; webmux picks it up automatically.
+- **Command palette** — Cmd/Ctrl+K to search every conversation (live + resumable history) by name and jump to it.
 - **Terminal** — xterm.js (Canvas renderer) over a WebSocket per session; 256-color, full CJK alignment, attaches at the right size instantly.
 - **File upload** — drag-and-drop or 📎 button; multiple/large files supported (up to 200MB), saved to `~/Downloads/webmux-uploads/` and the paths sent to the session.
-- **Native selection & scroll** — with Claude Code's fullscreen renderer (see below), the mouse wheel scrolls and text selects natively in the browser; no copy-mode toggle needed.
+- **Native selection & scroll** — with Claude Code's fullscreen renderer (see above), the mouse wheel scrolls and text selects/copies natively in the browser; no copy-mode toggle needed.
 - **Remote access** — HTTPS + login page, toggle from Settings.
 - **Theme** — dark/light toggle (light theme keeps terminal text readable via contrast adjustment).
 - **Settings** — web config page (port, remote, SSL certs, projects root).
